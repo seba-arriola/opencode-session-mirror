@@ -1,0 +1,13 @@
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# Installer backups
+*.bak
+
+# The mirror itself never lives here, but never commit it by accident either.
+*.snapshot.json
+*.events.jsonl
+opencode-mirror/

@@ -1,0 +1,36 @@
+// Minimal OpenCode V2 config reference.
+// Place at ~/.config/opencode/opencode.jsonc (global) or <project>/opencode.jsonc (project).
+//
+// The session-mirror plugin does NOT need an entry here: plugins under
+// ~/.config/opencode/plugins/ are auto-discovered.
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Default model as "provider/model".
+  "model": "provider/model",
+  "small_model": "provider/small-model",
+
+  // V2 providers (V1 used "provider" / "npm" / "options").
+  "providers": {
+    "ollama": {
+      "package": "aisdk:@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "settings": {
+        "baseURL": "http://localhost:11434/v1"
+      },
+      "models": {
+        "qwen2.5-coder-7b-32k": {
+          "name": "Qwen 7B 32k"
+        }
+      }
+    }
+  },
+
+  // V2 compaction (V1's "compaction.prune" no longer exists and logs a warning).
+  "compaction": {
+    "auto": true
+  },
+
+  // Package plugins only; local plugins in plugins/ are discovered automatically.
+  "plugins": []
+}

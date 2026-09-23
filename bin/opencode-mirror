@@ -1,0 +1,294 @@
+#!/usr/bin/env python3
+"""
+opencode-mirror — list, inspect and restore sessions backed up by the session-mirror
+plugin (OpenCode V2).
+
+Snapshots live in ~/.local/share/opencode-mirror/<sessionID>.snapshot.json in the
+{ info, messages } shape accepted by `opencode session import`.
+
+Usage:
+  opencode-mirror list                 Table of mirrored sessions
+  opencode-mirror status               Summary + mirror git state
+  opencode-mirror verify [<id>]        Validate snapshots (info + messages structure)
+  opencode-mirror restore <id> [opts]  Re-import one session
+  opencode-mirror restore-all [opts]   Re-import every session
+  opencode-mirror log <id>             Tail the event journal of a session
+  opencode-mirror git-log              Commit history of the mirror
+  opencode-mirror commit               Force a git checkpoint
+
+restore options:
+  --new-ids        Generate fresh IDs (session and messages) instead of keeping the
+                   originals. Required if the original session still exists in the DB.
+  --dir DIR        Import target directory (default: the snapshot's original directory).
+  --dry-run        Do not import; just show what would be done.
+"""
+import argparse
+import json
+import os
+import random
+import re
+import string
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
+
+ROOT = os.path.expanduser("~/.local/share/opencode-mirror")
+INDEX = os.path.join(ROOT, "index.json")
+
+
+def die(msg, code=1):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_index():
+    try:
+        with open(INDEX) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        die(f"could not read {INDEX}: {e}")
+
+
+def snap_path(sid):
+    return os.path.join(ROOT, f"{sid}.snapshot.json")
+
+
+def human_size(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024:
+            return f"{n:.0f}{u}"
+        n /= 1024
+    return f"{n:.0f}TB"
+
+
+def human_time(ms):
+    if not ms:
+        return "-"
+    try:
+        return datetime.fromtimestamp(ms / 1000).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
+def new_id(prefix, n):
+    return prefix + "".join(random.choice(string.ascii_letters + string.digits) for _ in range(n))
+
+
+def remap_ids(raw):
+    """Return (raw_with_new_ids, count) remapping every msg_* token in the JSON."""
+    ids = sorted(set(re.findall(r"msg_[A-Za-z0-9]+", raw)))
+    for old in ids:
+        raw = raw.replace(old, new_id("msg_", 21))
+    return raw, len(ids)
+
+
+def cmd_list(args):
+    idx = load_index()
+    if not idx:
+        print("(no mirrored sessions yet)")
+        return 0
+    rows = sorted(idx.values(), key=lambda r: r.get("updated") or 0, reverse=True)
+    print(f"{'session':32} {'msgs':>5} {'updated':16} title")
+    print("-" * 100)
+    for r in rows:
+        p = snap_path(r["id"])
+        size = human_size(os.path.getsize(p)) if os.path.exists(p) else "-"
+        print(f"{r['id']:32} {r.get('messages', '?'):>5} {human_time(r.get('updated')):16} "
+              f"{(r.get('title') or '')[:44]}  [{size}]")
+    return 0
+
+
+def cmd_status(args):
+    idx = load_index()
+    total = 0
+    for r in idx.values():
+        p = snap_path(r["id"])
+        if os.path.exists(p):
+            total += os.path.getsize(p)
+    print(f"mirror        : {ROOT}")
+    print(f"sessions      : {len(idx)}")
+    print(f"snapshot size : {human_size(total)}")
+    last = max((r.get("updated") or 0 for r in idx.values()), default=0)
+    print(f"last flush    : {human_time(last)}")
+    if os.path.isdir(os.path.join(ROOT, ".git")):
+        try:
+            out = subprocess.run(["git", "-C", ROOT, "log", "-1", "--format=%h %ci %s"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+            print(f"last commit   : {out or '(no commits)'}")
+        except Exception as e:
+            print(f"last commit   : (error: {e})")
+    else:
+        print("last commit   : (no git repo)")
+    return 0
+
+
+def cmd_verify(args):
+    idx = load_index()
+    targets = [args.id] if args.id else list(idx.keys())
+    bad = 0
+    for sid in targets:
+        p = snap_path(sid)
+        if not os.path.exists(p):
+            print(f"MISSING  {sid}")
+            bad += 1
+            continue
+        try:
+            d = json.load(open(p))
+            ok = isinstance(d.get("info"), dict) and isinstance(d.get("messages"), list)
+            print(f"{'OK ' if ok else 'BAD'}      {sid}  info={bool(d.get('info'))} messages={len(d['messages'])}")
+            if not ok:
+                bad += 1
+        except Exception as e:
+            print(f"BAD      {sid}  ({e})")
+            bad += 1
+    return 1 if bad else 0
+
+
+def do_restore(sid, new_ids, directory, dry_run):
+    p = snap_path(sid)
+    if not os.path.exists(p):
+        print(f"ERROR: no snapshot for {sid}", file=sys.stderr)
+        return 1
+    raw = open(p).read()
+    if new_ids:
+        raw, n = remap_ids(raw)
+        data = json.loads(raw)
+        data["info"]["id"] = new_id("ses_", 26)
+        data["info"].pop("parentID", None)
+        raw = json.dumps(data)
+        print(f"  remapped IDs: session -> {data['info']['id']}, {n} messages")
+    else:
+        data = json.loads(raw)
+    dest = directory or (data.get("info", {}).get("location", {}) or {}).get("directory")
+    if not dest or not os.path.isdir(dest):
+        dest = os.path.expanduser("~")
+    if dry_run:
+        print(f"  [dry-run] would import {sid} -> {dest}")
+        return 0
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
+        tf.write(raw)
+        tmp = tf.name
+    try:
+        r = subprocess.run(["opencode", "session", "import", tmp, "--directory", dest],
+                           capture_output=True, text=True)
+        out = (r.stdout + r.stderr).strip()
+        if r.returncode == 0:
+            print(f"  restored {sid} -> {dest}")
+            print(f"    {out.splitlines()[-1] if out else 'ok'}")
+            return 0
+        print(f"  FAILED {sid}: {out.splitlines()[-1] if out else 'error'}", file=sys.stderr)
+        return 1
+    finally:
+        os.unlink(tmp)
+
+
+def cmd_restore(args):
+    return do_restore(args.id, args.new_ids, args.dir, args.dry_run)
+
+
+def cmd_restore_all(args):
+    idx = load_index()
+    if not idx:
+        print("(no mirrored sessions)")
+        return 0
+    rc = 0
+    for sid in sorted(idx.keys(), key=lambda s: idx[s].get("updated") or 0):
+        rc |= do_restore(sid, args.new_ids, args.dir, args.dry_run)
+    return rc
+
+
+def cmd_log(args):
+    p = os.path.join(ROOT, f"{args.id}.events.jsonl")
+    if not os.path.exists(p):
+        die(f"no journal for {args.id}")
+    with open(p, "rb") as f:
+        f.seek(0, os.SEEK_END)
+        size = f.tell()
+        f.seek(max(0, size - 20000))
+        data = f.read().decode("utf-8", "replace").splitlines()
+    for line in data[-args.n:]:
+        try:
+            ev = json.loads(line)
+            print(f"{ev.get('type', '?'):32} {human_time(ev.get('created'))}  {json.dumps(ev.get('data', {}))[:120]}")
+        except Exception:
+            print(line[:160])
+    return 0
+
+
+def cmd_git_log(args):
+    try:
+        subprocess.run(["git", "-C", ROOT, "log", "--oneline", f"-{args.n}"])
+        return 0
+    except Exception as e:
+        die(f"git: {e}")
+
+
+def cmd_commit(args):
+    """Force a git checkpoint of the mirror."""
+    try:
+        subprocess.run(["git", "-C", ROOT, "add", "-A"], check=True, capture_output=True)
+        r = subprocess.run(
+            ["git", "-C", ROOT, "commit", "-q", "-m",
+             f"mirror manual {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"],
+            capture_output=True, text=True)
+        if r.returncode == 0:
+            head = subprocess.run(["git", "-C", ROOT, "log", "-1", "--oneline"],
+                                  capture_output=True, text=True).stdout.strip()
+            print(f"commit created: {head}")
+        else:
+            print("nothing to commit")
+        return 0
+    except Exception as e:
+        die(f"git: {e}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="opencode-mirror", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("list", help="list mirrored sessions").set_defaults(func=cmd_list)
+    sub.add_parser("status", help="mirror summary").set_defaults(func=cmd_status)
+
+    v = sub.add_parser("verify", help="validate snapshots")
+    v.add_argument("id", nargs="?")
+    v.set_defaults(func=cmd_verify)
+
+    def add_restore_opts(p):
+        p.add_argument("--new-ids", action="store_true", help="generate fresh IDs")
+        p.add_argument("--dir", help="target directory")
+        p.add_argument("--dry-run", action="store_true")
+
+    r = sub.add_parser("restore", help="restore one session")
+    r.add_argument("id")
+    add_restore_opts(r)
+    r.set_defaults(func=cmd_restore)
+
+    ra = sub.add_parser("restore-all", help="restore every session")
+    add_restore_opts(ra)
+    ra.set_defaults(func=cmd_restore_all)
+
+    lg = sub.add_parser("log", help="event journal of a session")
+    lg.add_argument("id")
+    lg.add_argument("-n", type=int, default=30)
+    lg.set_defaults(func=cmd_log)
+
+    gl = sub.add_parser("git-log", help="mirror commit history")
+    gl.add_argument("-n", type=int, default=20)
+    gl.set_defaults(func=cmd_git_log)
+
+    cm = sub.add_parser("commit", help="force a git checkpoint of the mirror")
+    cm.set_defaults(func=cmd_commit)
+
+    args = ap.parse_args()
+    if not getattr(args, "func", None):
+        ap.print_help()
+        return 0
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
