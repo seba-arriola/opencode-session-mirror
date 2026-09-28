@@ -125,6 +125,14 @@ opencode-mirror restore-all [opts]   # re-import every mirrored session
 | `--new-ids` | Generate fresh IDs (session **and** messages). **Required if the original session still exists**, otherwise message IDs collide. |
 | `--dir DIR` | Target directory for the import (default: the original directory from the snapshot). |
 | `--dry-run` | Show what would be done; import nothing. |
+| `--force` | Import even if the session already exists in the DB. May leave a collided copy; prefer `--new-ids`. |
+
+`restore` also runs a **pre-flight check**: because `opencode session import` fails with a
+`session_message` primary-key collision when the session still exists, `restore` detects that
+and refuses unless you pass `--new-ids` (remaps `msg_`/`prt_`/`ses_` tokens) or `--force`.
+
+The snapshot stores the V2 session context exactly as the runtime exports it, which is the
+shape `opencode session import` validates, so restored sessions keep their full transcript.
 
 ---
 
@@ -257,10 +265,12 @@ export PATH="$HOME/.local/bin:$PATH"     # add to ~/.bashrc or ~/.zshrc
 ```
 
 **`restore` fails with "Session already exists".**
-The session is still in the database. Use `--new-ids` to import it as a copy.
+The session is still in the database. `opencode-mirror` now detects this before importing and
+tells you to use `--new-ids` to import it as a copy.
 
-**`restore` fails with an internal error about message IDs.**
-Same cause: use `--new-ids`.
+**`restore` fails with `UNIQUE constraint failed: session_message.id`.**
+Message IDs collide with the live session (V2 keeps a per-session event table). Use `--new-ids`
+so both session and message IDs are remapped.
 
 ---
 

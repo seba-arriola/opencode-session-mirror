@@ -21,6 +21,13 @@ restore options:
                    originals. Required if the original session still exists in the DB.
   --dir DIR        Import target directory (default: the snapshot's original directory).
   --dry-run        Do not import; just show what would be done.
+  --force          Import even if the session already exists in the DB (may leave a
+                   collided copy; prefer --new-ids).
+
+Notes:
+  Snapshots are stored in the shape `opencode session import` consumes. Importing a
+  session that already exists needs --new-ids: it remaps every msg_/prt_ token and the
+  session id, avoiding the `session_message` primary-key collision.
 """
 import argparse
 import json
@@ -78,11 +85,86 @@ def new_id(prefix, n):
 
 
 def remap_ids(raw):
-    """Return (raw_with_new_ids, count) remapping every msg_* token in the JSON."""
-    ids = sorted(set(re.findall(r"msg_[A-Za-z0-9]+", raw)))
-    for old in ids:
-        raw = raw.replace(old, new_id("msg_", 21))
-    return raw, len(ids)
+    """
+    Return (raw_with_new_ids, count) remapping every id-like token in the JSON.
+
+    Both `msg_*` and `prt_*` IDs must be remapped: `opencode session import` persists
+    messages/parts and the V2 projector writes rows keyed by these IDs into
+    `session_message`, so keeping the originals collides with the live session
+    (`UNIQUE constraint failed: session_message.id`).
+    """
+    tokens = sorted(set(re.findall(r"(?:msg_|prt_)[A-Za-z0-9]+", raw)))
+    for old in tokens:
+        raw = raw.replace(old, new_id("msg_" if old.startswith("msg_") else "prt_", 21))
+    return raw, len(tokens)
+
+
+# ---------------------------------------------------------------------------
+# Snapshot shape
+#
+# This build's `opencode session import` validates each message against the V2
+# `Session.Message.Info` schema, i.e. the SAME shape that `ctx.session.context()`
+# returns. So snapshots are imported AS-IS; the only conversion needed is ID
+# remapping when the session already exists (to avoid `session_message` PK
+# collisions). See `remap_ids`.
+# ---------------------------------------------------------------------------
+
+
+def snapshot_stats(data):
+    """Return basic counts for a snapshot, for transparent reporting."""
+    msgs = data.get("messages") or []
+    parts = 0
+    for m in msgs:
+        if isinstance(m, dict):
+            if isinstance(m.get("parts"), list):
+                parts += len(m["parts"])
+            elif isinstance(m.get("content"), list):
+                parts += len(m["content"])
+    return {"messages": len(msgs), "parts": parts}
+
+
+def adapt_v2_to_v1(data):
+    """
+    Kept for backward compatibility. In this OpenCode build the import command
+    consumes the V2 message shape directly, so no structural conversion is done:
+    the snapshot is returned unchanged.
+    """
+    return data, {"already_v1": True, **snapshot_stats(data)}
+
+
+
+
+# ---------------------------------------------------------------------------
+# DB probing: does the session already exist?
+# ---------------------------------------------------------------------------
+
+def session_exists(sid, directory=None):
+    """
+    Return True if <sid> is already in the OpenCode DB, False if not, None if the
+    check could not be performed (opencode unavailable or output unparsable).
+
+    `opencode session list` is project-scoped, so the query must run in the
+    snapshot's original directory (passed here as `directory`).
+    """
+    cwd = directory if directory and os.path.isdir(directory) else None
+    try:
+        r = subprocess.run(
+            ["opencode", "session", "list", "--format", "json"],
+            capture_output=True, text=True, timeout=60, cwd=cwd)
+    except Exception:
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        rows = json.loads(r.stdout or "[]")
+    except Exception:
+        return None
+    if isinstance(rows, dict):
+        rows = rows.get("data") or rows.get("sessions") or []
+    if not isinstance(rows, list):
+        return None
+    return any(isinstance(x, dict) and x.get("id") == sid for x in rows)
+
 
 
 def cmd_list(args):
@@ -147,29 +229,56 @@ def cmd_verify(args):
     return 1 if bad else 0
 
 
-def do_restore(sid, new_ids, directory, dry_run):
+def do_restore(sid, new_ids, directory, dry_run, force=False):
     p = snap_path(sid)
     if not os.path.exists(p):
         print(f"ERROR: no snapshot for {sid}", file=sys.stderr)
         return 1
-    raw = open(p).read()
+
+    try:
+        data = json.load(open(p))
+    except Exception as e:
+        print(f"ERROR: invalid snapshot for {sid}: {e}", file=sys.stderr)
+        return 1
+
+    # Resolve the target directory early: `session list` is project-scoped, so the
+    # existence probe must run there.
+    snap_dir = (data.get("info", {}).get("location", {}) or {}).get("directory")
+    dest = directory or snap_dir
+    if not dest or not os.path.isdir(dest):
+        dest = os.path.expanduser("~")
+
+    # --- 1) detect collision BEFORE touching the DB -------------------------
+    exists = session_exists(sid, snap_dir or dest)
+    if exists is True and not new_ids and not force:
+        print(f"FAILED {sid}: session already exists in the OpenCode DB.", file=sys.stderr)
+        print("  Re-run with --new-ids to import it as a copy,", file=sys.stderr)
+        print("  or --force to attempt the import anyway.", file=sys.stderr)
+        return 1
+    if exists is None and not new_ids and not force:
+        print(f"  warning: could not query the DB for {sid}; importing as-is", file=sys.stderr)
+    if exists is True and new_ids:
+        print("  note: session already exists -> importing a copy with fresh IDs")
+
+    # --- 2) snapshot stats (shape is imported as-is) ------------------------
+    stats = snapshot_stats(data)
+    print(f"  snapshot: {stats['messages']} messages, {stats['parts']} parts")
+
+    # --- 3) optional ID remap ----------------------------------------------
     if new_ids:
+        raw = json.dumps(data)
         raw, n = remap_ids(raw)
         data = json.loads(raw)
         data["info"]["id"] = new_id("ses_", 26)
         data["info"].pop("parentID", None)
-        raw = json.dumps(data)
-        print(f"  remapped IDs: session -> {data['info']['id']}, {n} messages")
-    else:
-        data = json.loads(raw)
-    dest = directory or (data.get("info", {}).get("location", {}) or {}).get("directory")
-    if not dest or not os.path.isdir(dest):
-        dest = os.path.expanduser("~")
+        print(f"  remapped IDs: session -> {data['info']['id']}, {n} id tokens")
+
     if dry_run:
         print(f"  [dry-run] would import {sid} -> {dest}")
         return 0
+
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as tf:
-        tf.write(raw)
+        tf.write(json.dumps(data))
         tmp = tf.name
     try:
         r = subprocess.run(["opencode", "session", "import", tmp, "--directory", dest],
@@ -179,14 +288,20 @@ def do_restore(sid, new_ids, directory, dry_run):
             print(f"  restored {sid} -> {dest}")
             print(f"    {out.splitlines()[-1] if out else 'ok'}")
             return 0
-        print(f"  FAILED {sid}: {out.splitlines()[-1] if out else 'error'}", file=sys.stderr)
+        # --- 4) actionable error reporting ---------------------------------
+        last = out.splitlines()[-1] if out else "error"
+        if "session_message" in out and "UNIQUE constraint failed" in out:
+            print(f"  FAILED {sid}: message IDs collide in the DB (session_message.id).", file=sys.stderr)
+            print("  Use --new-ids to import a copy with fresh message IDs.", file=sys.stderr)
+        else:
+            print(f"  FAILED {sid}: {last}", file=sys.stderr)
         return 1
     finally:
         os.unlink(tmp)
 
 
 def cmd_restore(args):
-    return do_restore(args.id, args.new_ids, args.dir, args.dry_run)
+    return do_restore(args.id, args.new_ids, args.dir, args.dry_run, args.force)
 
 
 def cmd_restore_all(args):
@@ -196,7 +311,7 @@ def cmd_restore_all(args):
         return 0
     rc = 0
     for sid in sorted(idx.keys(), key=lambda s: idx[s].get("updated") or 0):
-        rc |= do_restore(sid, args.new_ids, args.dir, args.dry_run)
+        rc |= do_restore(sid, args.new_ids, args.dir, args.dry_run, args.force)
     return rc
 
 
@@ -261,6 +376,8 @@ def main():
         p.add_argument("--new-ids", action="store_true", help="generate fresh IDs")
         p.add_argument("--dir", help="target directory")
         p.add_argument("--dry-run", action="store_true")
+        p.add_argument("--force", action="store_true",
+                       help="import even if the session already exists")
 
     r = sub.add_parser("restore", help="restore one session")
     r.add_argument("id")

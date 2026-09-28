@@ -3,10 +3,15 @@
  * session-mirror — real-time backup of OpenCode V2 sessions.
  *
  * For every session it writes, under ~/.local/share/opencode-mirror/ :
- *   <sessionID>.snapshot.json  -> { info, messages }  (export/import shape, restorable)
+ *   <sessionID>.snapshot.json  -> { info, messages }  (OpenCode import shape, restorable)
  *   <sessionID>.events.jsonl   -> raw append-only event journal, one event per line
  *   index.json                 -> session index (title, project, dir, message count, dates)
  * and versions everything with a local git repo (coalesced commits, no cron).
+ *
+ * The snapshot stores the V2 session context exactly as `session.context()` returns it,
+ * which is the shape `opencode session import` validates. Restoring a session that still
+ * exists requires remapping IDs (msg_/prt_/ses_) so the per-session event table does not
+ * collide; the `opencode-mirror restore --new-ids` command handles that.
  *
  * Note: the runtime does NOT resolve `@opencode/plugin` for local plugins, so this file
  * exports a plain { id, setup } object (equivalent to Plugin.define).

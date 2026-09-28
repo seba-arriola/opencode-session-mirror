@@ -11,3 +11,7 @@ Thumbs.db
 *.snapshot.json
 *.events.jsonl
 opencode-mirror/
+
+# Python bytecode
+__pycache__/
+*.pyc
